@@ -507,8 +507,13 @@ class RelativeMouseModel {
     });
   }
 
-  // Flag to skip the first mouse move event after recenter (it's the recenter itself).
-  bool _skipNextMouseMove = false;
+  // OS cursor warps may be reported after physical mouse moves, particularly
+  // with high-polling-rate mice. Ignore the warp by its destination rather
+  // than skipping whichever event happens to arrive next.
+  Offset? _pendingWarpCenterLocal;
+  DateTime? _pendingWarpExpiry;
+  static const Duration _warpEventWindow = Duration(milliseconds: 300);
+  static const double _warpCenterTolerance = 32.0;
 
   /// Handle relative mouse movement based on current local pointer position.
   /// Returns true if the event was handled in relative mode, false otherwise.
@@ -523,11 +528,30 @@ class RelativeMouseModel {
     // Pointer move/hover implies we're inside the remote image.
     _ensurePointerLockEngaged();
 
-    // Skip the mouse move event triggered by recenter operation itself.
-    if (_skipNextMouseMove) {
-      _skipNextMouseMove = false;
-      _lastPointerLocalPos = localPosition;
-      return true;
+    // Filter a synthetic cursor-warp event even when physical mouse events
+    // arrive before it. Skipping the first event unconditionally can drop a
+    // real movement and then forward the warp as a large opposite delta.
+    final warpCenter = _pendingWarpCenterLocal;
+    if (warpCenter != null) {
+      final expired = _pendingWarpExpiry == null ||
+          DateTime.now().isAfter(_pendingWarpExpiry!);
+      if (expired) {
+        _pendingWarpCenterLocal = null;
+        _pendingWarpExpiry = null;
+      } else {
+        final distanceToCenter = (localPosition - warpCenter).distance;
+        final previous = _lastPointerLocalPos;
+        final largeJumpTowardCenter = previous != null &&
+            (localPosition - previous).distance > 64.0 &&
+            distanceToCenter < (previous - warpCenter).distance * 0.5;
+        if (distanceToCenter <= _warpCenterTolerance ||
+            largeJumpTowardCenter) {
+          _pendingWarpCenterLocal = null;
+          _pendingWarpExpiry = null;
+          _lastPointerLocalPos = localPosition;
+          return true;
+        }
+      }
     }
 
     final lastLocal = _lastPointerLocalPos;
@@ -738,15 +762,19 @@ class RelativeMouseModel {
         // Check preconditions before each attempt.
         if (!enabled.value || !getPointerInsideImage()) return;
 
+        // Arm warp recognition BEFORE moving the cursor. The OS/Flutter may
+        // enqueue the synthetic pointer event before this function returns.
+        _pendingWarpCenterLocal = _pointerLockCenterLocal;
+        _pendingWarpExpiry = DateTime.now().add(_warpEventWindow);
         final ok = bind.mainSetCursorPosition(
           x: center.dx.toInt(),
           y: center.dy.toInt(),
         );
         if (ok) {
-          // Skip the next mouse move event - it's triggered by the recenter itself.
-          _skipNextMouseMove = true;
           return;
         }
+        _pendingWarpCenterLocal = null;
+        _pendingWarpExpiry = null;
 
         // Wait before retrying (except on the last attempt).
         if (attempt < _recenterMaxRetries - 1) {
@@ -1007,7 +1035,8 @@ class RelativeMouseModel {
     _pointerLockCenterScreen = null;
     _pointerRegionTopLeftGlobal = null;
     _lastPointerLocalPos = null;
-    _skipNextMouseMove = false;
+    _pendingWarpCenterLocal = null;
+    _pendingWarpExpiry = null;
     setPointerInsideImage(false);
     _cursorClipApplied = false;
     _exitShortcutKeyDown = false;
